@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Face Mouse - Joystick Mode</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; background: #000; color: #0f0; font-family: sans-serif; text-align: center; overflow: hidden; }
+        /* 【修正】transform: scaleX(-1); を削除し、キャンバス全体の反転を解除しました */
+        canvas { width: 100vw; height: 60vh; object-fit: contain; background: #111; border-bottom: 2px solid #333; }
+        .ui { padding: 15px; background: #222; }
+        button { padding: 15px 30px; font-size: 20px; background: #0f0; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; margin: 0 10px; }
+        #debug { color: #fff; font-family: monospace; font-size: 16px; margin-top: 10px; white-space: pre; }
+    </style>
+</head>
+<body>
+
+    <div class="ui">
+        <button id="connectBtn">1. ESP32に接続</button>
+        <button id="resetCenterBtn">2. 中心位置をリセット</button>
+        <div id="debug">接続後、正面を向いて「口を開ける」か「リセットボタン」で初期位置を設定してください。\n両眉上げで一時停止/再開、口を開けてクリックです。</div>
+    </div>
+    
+    <video id="input_video" style="display:none"></video>
+    <canvas id="output_canvas"></canvas>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const debugEl = document.getElementById('debug');
+
+let characteristic;
+const SERVICE_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+const CHAR_UUID    = "19b10001-e8f2-537e-4f6c-d104768a1214";
+
+// ジョイスティック制御用パラメータ
+const DEADZONE = 0.015;      // これ以下の細かい顔のブレは無視する（遊びの領域）
+const BASE_SPEED = 0.03;     // 基本の移動スピード
+const ACCEL_FACTOR = 1.5;    // 大きく動かしたときの加速の強さ
+
+let baseFaceX = null, baseFaceY = null;
+let baseLeftDist = null, baseRightDist = null; 
+let isPaused = false;                         
+let lastBrowsRaised = false;                   
+let currentX = 0.5, currentY = 0.5; // マウスの仮想絶対座標(0.0〜1.0)
+
+// 通信制御用
+let isSending = false;
+let nextData = null;
+
+// BLE接続
+document.getElementById('connectBtn').addEventListener('click', async () => {
+    try {
+        const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE_UUID] }] });
+        const server = await device.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        characteristic = await service.getCharacteristic(CHAR_UUID);
+        debugEl.innerText = "接続成功！正面を向いて口を開け、中心位置をセットしてください。";
+    } catch (e) { alert("接続失敗: " + e); }
+});
+
+// 手動で中心位置をリセットするボタン
+document.getElementById('resetCenterBtn').addEventListener('click', () => {
+    baseFaceX = null; // 次のフレームで現在の顔位置を新しい中心として再設定
+    debugEl.innerText = "中心位置をリセットします...";
+});
+
+// 3次元座標の距離を計算するヘルパー関数
+function getDistance(p1, p2) {
+    return Math.sqrt(
+        Math.pow(p1.x - p2.x, 2) +
+        Math.pow(p1.y - p2.y, 2) +
+        Math.pow(p1.z - p2.z, 2)
+    );
+}
+
+// 非ブロッキング送信関数
+function sendData(px, py, click) {
+    nextData = { px, py, click };
+    processQueue();
+}
+
+async function processQueue() {
+    if (isSending || !characteristic || !nextData) return;
+    
+    isSending = true;
+    const { px, py, click } = nextData;
+    nextData = null; 
+
+    const xVal = Math.max(0, Math.min(32767, Math.round(px * 32767)));
+    const yVal = Math.max(0, Math.min(32767, Math.round(py * 32767)));
+    
+    const buffer = new Uint8Array(5);
+    buffer[0] = xVal & 0xFF;
+    buffer[1] = (xVal >> 8) & 0xFF;
+    buffer[2] = yVal & 0xFF;
+    buffer[3] = (yVal >> 8) & 0xFF;
+    buffer[4] = click ? 1 : 0;
+    
+    try {
+        await characteristic.writeValue(buffer);
+    } catch (e) { console.error(e); }
+    
+    isSending = false;
+    if (nextData) processQueue();
+}
+
+function onResults(results) {
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+    // 【修正】カメラ映像だけをプログラム上で左右反転（鏡合わせ）して描画
+    canvasCtx.save();
+    canvasCtx.translate(canvasElement.width, 0);
+    canvasCtx.scale(-1, 1);
+    canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+    canvasCtx.restore();
+
+    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+        const nose = landmarks[1];
+        const mouthOpen = (landmarks[14].y - landmarks[13].y) > 0.01;
+
+        const currentFaceSize = getDistance(landmarks[133], landmarks[362]);
+
+        if (currentFaceSize > 0) {
+            const currentLeftDist = getDistance(landmarks[107], landmarks[133]) / currentFaceSize;
+            const currentRightDist = getDistance(landmarks[336], landmarks[362]) / currentFaceSize;
+
+            if (baseFaceX === null && mouthOpen) {
+                baseFaceX = nose.x;
+                baseFaceY = nose.y;
+                baseLeftDist = currentLeftDist;
+                baseRightDist = currentRightDist;
+            }
+
+            if (baseFaceX !== null && baseLeftDist !== null) {
+                const leftBrowsRaised = (currentLeftDist / baseLeftDist) > 1.20;
+                const rightBrowsRaised = (currentRightDist / baseRightDist) > 1.20;
+                const browsRaised = leftBrowsRaised && rightBrowsRaised;
+
+                if (browsRaised && !lastBrowsRaised) {
+                    isPaused = !isPaused;
+                    if (!isPaused) {
+                        baseFaceX = nose.x;
+                        baseFaceY = nose.y;
+                    }
+                }
+                lastBrowsRaised = browsRaised;
+
+                let activeDx = 0;
+                let activeDy = 0;
+
+                if (!isPaused) {
+                    // X座標の計算：物理的に左に動くとカーソルも左にいくように計算
+                    let dx = baseFaceX - nose.x; 
+                    let dy = nose.y - baseFaceY; 
+
+                    if (Math.abs(dx) > DEADZONE) {
+                        activeDx = dx > 0 ? dx - DEADZONE : dx + DEADZONE;
+                    }
+                    if (Math.abs(dy) > DEADZONE) {
+                        activeDy = dy > 0 ? dy - DEADZONE : dy + DEADZONE;
+                    }
+
+                    let moveX = Math.sign(activeDx) * (Math.abs(activeDx) * BASE_SPEED + Math.pow(Math.abs(activeDx), 2) * ACCEL_FACTOR);
+                    let moveY = Math.sign(activeDy) * (Math.abs(activeDy) * BASE_SPEED + Math.pow(Math.abs(activeDy), 2) * ACCEL_FACTOR);
+
+                    currentX = Math.max(0, Math.min(1, currentX + moveX));
+                    currentY = Math.max(0, Math.min(1, currentY + moveY));
+
+                    sendData(currentX, currentY, mouthOpen);
+                }
+
+                let statusMsg = isPaused ? "PAUSED (一時停止中)" : "ACTIVE";
+                debugEl.innerText = `Cursor X: ${Math.round(currentX * 100)}%, Y: ${Math.round(currentY * 100)}%\n` +
+                                   `Tilt X: ${activeDx.toFixed(3)}, Tilt Y: ${activeDy.toFixed(3)}\n` +
+                                   `Click: ${mouthOpen ? "ON" : "OFF"} | Status: ${statusMsg}`;
+                
+                drawUI(baseFaceX, baseFaceY, nose.x, nose.y, currentX, currentY, mouthOpen, isPaused);
+            }
+        }
+    }
+    canvasCtx.restore();
+}
+
+function drawUI(bx, by, nx, ny, cx, cy, click, isPaused) {
+    // 【修正】顔の位置を示すUI（青枠や緑点）は映像の鏡合わせに合わせて左右反転させる
+    let mirrorBx = 1.0 - bx;
+    let mirrorNx = 1.0 - nx;
+
+    // 1. ジョイスティックの描画（反転済み座標を使用）
+    canvasCtx.strokeStyle = "rgba(0, 0, 255, 0.5)";
+    canvasCtx.lineWidth = 2;
+    canvasCtx.strokeRect(mirrorBx * canvasElement.width - 20, by * canvasElement.height - 20, 40, 40);
+    
+    canvasCtx.beginPath();
+    canvasCtx.moveTo(mirrorBx * canvasElement.width, by * canvasElement.height);
+    canvasCtx.lineTo(mirrorNx * canvasElement.width, ny * canvasElement.height);
+    canvasCtx.strokeStyle = "rgba(255, 255, 255, 0.5)";
+    canvasCtx.stroke();
+
+    canvasCtx.fillStyle = click ? "red" : (isPaused ? "magenta" : "lime");
+    canvasCtx.beginPath();
+    canvasCtx.arc(mirrorNx * canvasElement.width, ny * canvasElement.height, 8, 0, 2*Math.PI);
+    canvasCtx.fill();
+
+    // 2. 仮想マウスカーソルの描画（【修正】反転させずに実際の画面と同じ向きで描画）
+    canvasCtx.fillStyle = "yellow";
+    canvasCtx.beginPath();
+    canvasCtx.arc(cx * canvasElement.width, cy * canvasElement.height, 15, 0, 2*Math.PI);
+    canvasCtx.fill();
+    canvasCtx.strokeStyle = "white";
+    canvasCtx.stroke();
+}
+
+// MediaPipeセットアップ
+const faceMesh = new FaceMesh({ locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}` });
+faceMesh.setOptions({ maxNumFaces: 1, refineLandmarks: false, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+faceMesh.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => { await faceMesh.send({image: videoElement}); },
+    width: 640, height: 360
+});
+camera.start();
+</script>
+</body>
+</html>
